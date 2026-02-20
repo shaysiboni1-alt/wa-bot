@@ -12,7 +12,7 @@ const PORT = process.env.PORT || 3000;
 const SHEET_ID = process.env.SHEET_ID;
 
 // Green API
-const GREEN_API_ID = process.env.GREEN_API_ID; // waInstanceXXXX
+const GREEN_API_ID = process.env.GREEN_API_ID;     // מספר בלבד (בלי waInstance)
 const GREEN_API_TOKEN = process.env.GREEN_API_TOKEN;
 
 // ===== Helpers =====
@@ -45,7 +45,7 @@ function extractMsgType(payload) {
   return (
     payload.typeMessage ||
     payload.messageData?.typeMessage ||
-    (payload.messageData?.textMessageData ? "text" : "unknown")
+    (payload.messageData?.textMessageData ? "textMessage" : "unknown")
   );
 }
 
@@ -67,12 +67,10 @@ function getGoogleAuthFromEnv() {
 
   let creds;
   try {
-    // maybe plain JSON
-    creds = JSON.parse(raw);
+    creds = JSON.parse(raw); // אולי JSON רגיל
   } catch {
-    // assume base64
     const decoded = Buffer.from(raw, "base64").toString("utf-8");
-    creds = JSON.parse(decoded);
+    creds = JSON.parse(decoded); // Base64 -> JSON
   }
 
   return new google.auth.GoogleAuth({
@@ -98,38 +96,24 @@ async function appendRow(rangeA1, valuesRow) {
   });
 }
 
-/**
- * Find lead row by phone in leads sheet.
- * returns { rowIndex (1-based), rowValues } or null
- */
 async function findLeadByPhone(phone) {
   const auth = getGoogleAuthFromEnv();
   const sheets = getSheetsClient(auth);
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SHEET_ID,
-    range: "leads!A:F", // phone..last_message
+    range: "leads!A:F",
   });
 
   const rows = res.data.values || [];
-  if (rows.length <= 1) return null; // header only
-
-  // rows[0] header
   for (let i = 1; i < rows.length; i++) {
-    const row = rows[i];
-    const rowPhone = row?.[0] || "";
-    if (String(rowPhone) === String(phone)) {
-      // sheet row index is i+1 (because header row is 1)
-      return { rowIndex: i + 1, rowValues: row };
+    if (String(rows[i]?.[0] || "") === String(phone)) {
+      return { rowIndex: i + 1, rowValues: rows[i] };
     }
   }
   return null;
 }
 
-/**
- * Update or create lead row.
- * leads columns: phone | name | status | created_at | updated_at | last_message
- */
 async function upsertLead({ phone, lastMessage }) {
   const auth = getGoogleAuthFromEnv();
   const sheets = getSheetsClient(auth);
@@ -150,11 +134,9 @@ async function upsertLead({ phone, lastMessage }) {
   }
 
   const rowIndex = existing.rowIndex;
-  // Update updated_at (E) and last_message (F)
-  const updateRange = `leads!E${rowIndex}:F${rowIndex}`;
   await sheets.spreadsheets.values.update({
     spreadsheetId: SHEET_ID,
-    range: updateRange,
+    range: `leads!E${rowIndex}:F${rowIndex}`,
     valueInputOption: "RAW",
     requestBody: { values: [[ts, safeStr(lastMessage, 500)]] },
   });
@@ -169,25 +151,19 @@ async function sendWhatsAppMessage(chatId, text) {
   }
 
   const url = `https://api.green-api.com/waInstance${GREEN_API_ID}/sendMessage/${GREEN_API_TOKEN}`;
-  const payload = {
-    chatId,
-    message: text,
-  };
+  const payload = { chatId, message: text };
 
   const res = await axios.post(url, payload, { timeout: 15000 });
   return res.data;
 }
 
 // ===== Routes =====
-app.get("/", (req, res) => {
-  res.status(200).send("WA Bot Server is running");
-});
+app.get("/", (req, res) => res.status(200).send("WA Bot Server is running"));
 
 app.post("/webhook", async (req, res) => {
-  // 1) respond fast to prevent retries
+  // חשוב: 200 מיד
   res.sendStatus(200);
 
-  // 2) process async
   try {
     const payload = req.body || {};
     const ts = nowIso();
@@ -197,53 +173,55 @@ app.post("/webhook", async (req, res) => {
     const msgType = extractMsgType(payload);
     const text = extractText(payload);
 
-    // לוג נכנס
-    const incomingRow = [
-      ts, // timestamp
-      phone, // phone
-      chatId, // chat_id
-      "incoming", // direction
-      msgType, // msg_type
-      safeStr(text || payload, 2000), // message
-      "", // intent
-      "", // ai_model
-      "", // tokens_in
-      "", // tokens_out
-    ];
-    await appendRow("conversation_logs!A:J", incomingRow);
+    // ✅ לוג ל-Render כדי שתראה תנועה
+    console.log(`[WEBHOOK] chatId=${chatId} phone=${phone} msgType=${msgType} text=${safeStr(text, 200)}`);
 
-    // עדכון leads
+    // לוג נכנס ל-Sheets
+    await appendRow("conversation_logs!A:J", [
+      ts,
+      phone,
+      chatId,
+      "incoming",
+      msgType,
+      safeStr(text || payload, 2000),
+      "",
+      "",
+      "",
+      "",
+    ]);
+
     if (phone) {
       await upsertLead({ phone, lastMessage: text || `[${msgType}]` });
     }
 
-    // === Reply בסיסי כדי לוודא שהשליחה עובדת (בשלב הבא נחליף ל-AI) ===
-    if (chatId && msgType === "text" && text) {
-      const reply = `קיבלתי ✅\nכתבת: "${text}"\n\nרק רגע, אני בודק ומחזיר תשובה.`;
-      await sendWhatsAppMessage(chatId, reply);
+    // ✅ תנאי נכון: textMessage / extendedTextMessage וכו'
+    const isText = String(msgType).toLowerCase().includes("text");
+    if (chatId && isText && text) {
+      const reply = `קיבלתי ✅\nכתבת: "${text}"\n\nאיך אפשר לעזור?`;
 
-      // לוג יוצא
-      const outgoingRow = [
-        nowIso(),
-        phone,
-        chatId,
-        "outgoing",
-        "text",
-        safeStr(reply, 2000),
-        "",
-        "",
-        "",
-        "",
-      ];
-      await appendRow("conversation_logs!A:J", outgoingRow);
+      try {
+        const sendRes = await sendWhatsAppMessage(chatId, reply);
+        console.log("[SEND OK]", sendRes);
+
+        await appendRow("conversation_logs!A:J", [
+          nowIso(),
+          phone,
+          chatId,
+          "outgoing",
+          "textMessage",
+          safeStr(reply, 2000),
+          "",
+          "",
+          "",
+          "",
+        ]);
+      } catch (sendErr) {
+        console.error("[SEND FAIL]", sendErr?.response?.data || sendErr);
+      }
     }
   } catch (err) {
     console.error("Webhook processing error:", err?.response?.data || err);
-
-    // אפשר גם לכתוב לוג שגיאה ל-sheet אם תרצה (אופציונלי)
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
