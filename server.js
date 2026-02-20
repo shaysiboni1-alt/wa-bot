@@ -10,10 +10,21 @@ const PORT = process.env.PORT || 3000;
 
 // ===== ENV =====
 const SHEET_ID = process.env.SHEET_ID;
-
-// Green API
-const GREEN_API_ID = process.env.GREEN_API_ID;     // מספר בלבד (בלי waInstance)
+const GREEN_API_ID = process.env.GREEN_API_ID;     // מספר בלבד
 const GREEN_API_TOKEN = process.env.GREEN_API_TOKEN;
+
+// ===== In-memory de-dup cache =====
+// מונע עיבוד כפול (retries/duplicates) וגם עוזר לעצור לולאות.
+const seen = new Map(); // key -> timestamp(ms)
+const SEEN_TTL_MS = 2 * 60 * 1000; // 2 דקות
+
+function cleanupSeen() {
+  const now = Date.now();
+  for (const [k, t] of seen.entries()) {
+    if (now - t > SEEN_TTL_MS) seen.delete(k);
+  }
+}
+setInterval(cleanupSeen, 30 * 1000).unref();
 
 // ===== Helpers =====
 function nowIso() {
@@ -60,6 +71,50 @@ function extractText(payload) {
   );
 }
 
+/**
+ * מזהה האם זו הודעה שנשלחה ע"י החשבון שלנו (כלומר outgoing echo).
+ * Green API בדר"כ מספק fromMe / senderData.sender / chatId וכו'. השדות משתנים בין סוגי notifications.
+ * נשתמש בכמה בדיקות "סלחניות".
+ */
+function isFromMe(payload) {
+  // דגלים נפוצים:
+  if (payload.fromMe === true) return true;
+  if (payload.senderData?.fromMe === true) return true;
+  if (payload.messageData?.fromMe === true) return true;
+
+  // חלק מהאירועים כוללים sender = chatId של הבוט עצמו או "me"
+  const sender = payload.senderData?.sender || payload.messageData?.sender || "";
+  if (sender && (String(sender).includes("@c.us") || String(sender).includes("@g.us"))) {
+    // אם sender == chatId, לעיתים זה אומר "הצד השני", אבל לא תמיד.
+    // לא מסתמכים על זה לבד.
+  }
+
+  // דרך מעשית: אם הטקסט מתחיל בדיוק במה שהבוט שולח (קיבלתי ✅) סביר שזה echo
+  const text = extractText(payload);
+  if (text && text.startsWith("קיבלתי ✅")) return true;
+
+  // אם Green API שולח סוג notification "outgoing" (תלוי הגדרה)
+  const typeWebhook = payload.typeWebhook || payload.eventType || "";
+  if (String(typeWebhook).toLowerCase().includes("outgoing")) return true;
+
+  return false;
+}
+
+/**
+ * יוצר מפתח ייחודי להודעה כדי למנוע דופליקציה.
+ */
+function makeDedupKey(payload) {
+  const chatId = extractChatId(payload);
+  const msgId =
+    payload.idMessage ||
+    payload.messageData?.idMessage ||
+    payload.messageData?.extendedTextMessageData?.contextInfo?.stanzaId ||
+    "";
+  const text = extractText(payload);
+  const type = payload.typeWebhook || payload.eventType || payload.typeMessage || payload.messageData?.typeMessage || "";
+  return `${chatId}|${msgId}|${type}|${text}`.slice(0, 500);
+}
+
 // ===== Google Auth (Base64 supported) =====
 function getGoogleAuthFromEnv() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
@@ -67,10 +122,10 @@ function getGoogleAuthFromEnv() {
 
   let creds;
   try {
-    creds = JSON.parse(raw); // אולי JSON רגיל
+    creds = JSON.parse(raw);
   } catch {
     const decoded = Buffer.from(raw, "base64").toString("utf-8");
-    creds = JSON.parse(decoded); // Base64 -> JSON
+    creds = JSON.parse(decoded);
   }
 
   return new google.auth.GoogleAuth({
@@ -164,19 +219,32 @@ app.post("/webhook", async (req, res) => {
   // חשוב: 200 מיד
   res.sendStatus(200);
 
-  try {
-    const payload = req.body || {};
-    const ts = nowIso();
+  const payload = req.body || {};
 
+  // 1) דה-דופ
+  const dedupKey = makeDedupKey(payload);
+  if (seen.has(dedupKey)) {
+    return; // כבר טופל
+  }
+  seen.set(dedupKey, Date.now());
+
+  // 2) לא להגיב להודעות שלנו
+  if (isFromMe(payload)) {
+    // עדיין אפשר לשמור לוג אם תרצה, אבל כרגע נמנע כתיבות כדי לא להגיע ל-429
+    console.log("[SKIP fromMe/echo]");
+    return;
+  }
+
+  try {
+    const ts = nowIso();
     const chatId = extractChatId(payload);
     const phone = extractPhoneFromChatId(chatId);
     const msgType = extractMsgType(payload);
     const text = extractText(payload);
 
-    // ✅ לוג ל-Render כדי שתראה תנועה
-    console.log(`[WEBHOOK] chatId=${chatId} phone=${phone} msgType=${msgType} text=${safeStr(text, 200)}`);
+    console.log(`[IN] chatId=${chatId} phone=${phone} type=${msgType} text=${safeStr(text, 200)}`);
 
-    // לוג נכנס ל-Sheets
+    // לוג רק על נכנס (מונע עומס כתיבה)
     await appendRow("conversation_logs!A:J", [
       ts,
       phone,
@@ -194,30 +262,15 @@ app.post("/webhook", async (req, res) => {
       await upsertLead({ phone, lastMessage: text || `[${msgType}]` });
     }
 
-    // ✅ תנאי נכון: textMessage / extendedTextMessage וכו'
     const isText = String(msgType).toLowerCase().includes("text");
     if (chatId && isText && text) {
       const reply = `קיבלתי ✅\nכתבת: "${text}"\n\nאיך אפשר לעזור?`;
 
-      try {
-        const sendRes = await sendWhatsAppMessage(chatId, reply);
-        console.log("[SEND OK]", sendRes);
+      const sendRes = await sendWhatsAppMessage(chatId, reply);
+      console.log("[SEND OK]", sendRes);
 
-        await appendRow("conversation_logs!A:J", [
-          nowIso(),
-          phone,
-          chatId,
-          "outgoing",
-          "textMessage",
-          safeStr(reply, 2000),
-          "",
-          "",
-          "",
-          "",
-        ]);
-      } catch (sendErr) {
-        console.error("[SEND FAIL]", sendErr?.response?.data || sendErr);
-      }
+      // בכוונה לא כותבים outgoing ל-Sheets בשלב זה כדי למנוע 429.
+      // אם תרצה, נוסיף batching/queue בשלב הבא.
     }
   } catch (err) {
     console.error("Webhook processing error:", err?.response?.data || err);
